@@ -1,0 +1,494 @@
+"""
+ACDC cardiac pathology classification with a PyTorch DNN.
+
+Pipeline:
+    1. Extract clinical + volumetric features per patient (using the
+       provided ACDC I/O code, with the cardiac_metrics() bug fixed).
+    2. Build a labelled feature matrix (X, y) from Info.cfg groups.
+    3. STAGE A (model selection only): stratified train/val split of the
+       100 labelled patients, train an MLP tracking the best epoch
+       (lowest val loss). This model/split is then discarded — its only
+       output is the chosen number of epochs.
+    4. STAGE B (final refit): train a FRESH model on ALL 100 labelled
+       patients (no val holdout) for exactly that many epochs, with
+       feature standardization recomputed on the full training set.
+    5. STAGE C: evaluate this final model on the truly unseen test
+       patients (101-150), which never influenced Stage A or B.
+
+"""
+
+import os
+from pathlib import Path
+
+import numpy as np
+import nibabel as nib
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+
+import matplotlib.pyplot as plt
+
+# ============================================================
+# CONFIG / PATHS  (same as your original code)
+# ============================================================
+BASE_DIR = Path(__file__).resolve().parent
+TRAINING_DIR = BASE_DIR / "training"
+TESTING_DIR = BASE_DIR / "testing"
+CACHE_DIR = BASE_DIR / "cache"
+
+CLASSES = ["NOR", "DCM", "HCM", "MINF", "RV"]
+CLASS_TO_IDX = {c: i for i, c in enumerate(CLASSES)}
+
+LABELS = {"RV": 1, "MYO": 2, "LV": 3}
+TRAIN_IDS = list(range(1, 101))
+TEST_IDS = list(range(101, 151))
+
+FEATURE_NAMES = [
+    "height", "weight", "bsa",
+    "LVED", "LVES", "RVED", "RVES",
+    "LVEF", "RVEF", "MYOED", "MYOES",
+]
+
+
+def patient_dir(pid):
+    split_dir = TRAINING_DIR if pid <= 100 else TESTING_DIR
+    return split_dir / f"patient{pid:03d}"
+
+
+# ============================================================
+# READ Info.cfg
+# ============================================================
+def read_info(pid):
+    info = {}
+    with open(os.path.join(patient_dir(pid), "Info.cfg")) as f:
+        for line in f:
+            k, v = line.strip().split(":")
+            info[k.strip()] = v.strip()
+    return {
+        "ED": int(info["ED"]),
+        "ES": int(info["ES"]),
+        # official ACDC test set withholds the diagnosis -> Group may be absent
+        "group": info.get("Group"),
+        "height": float(info["Height"]),
+        "weight": float(info["Weight"]),
+        "nframes": int(info["NbFrame"]),
+    }
+
+
+# ============================================================
+# LOAD NIFTI
+# ============================================================
+def _load_nii(path):
+    im = nib.load(str(path))
+    arr = np.asarray(im.dataobj)
+    zooms = im.header.get_zooms()
+    return arr, zooms, im.affine
+
+
+# ============================================================
+# LOAD ONE PATIENT
+# ============================================================
+def load_patient(pid):
+    CACHE_DIR.mkdir(exist_ok=True)
+    cache = CACHE_DIR / f"patient{pid:03d}.npz"
+    info = read_info(pid)
+
+    if not cache.exists():
+        d = patient_dir(pid)
+        out = {}
+        for phase in ["ED", "ES"]:
+            frame = info[phase]
+            filename = d / f"patient{pid:03d}_frame{frame:02d}"
+            image_path = Path(str(filename) + ".nii.gz")
+            gt_path = Path(str(filename) + "_gt.nii.gz")
+            img, zooms, affine = _load_nii(image_path)
+            gt, _, _ = _load_nii(gt_path)
+            out["img_" + phase] = img.transpose(2, 0, 1).astype(np.float32)
+            out["gt_" + phase] = gt.transpose(2, 0, 1).astype(np.uint8)
+        out["spacing"] = np.array([zooms[2], zooms[0], zooms[1]], dtype=np.float32)
+        out["affine"] = affine
+        np.savez_compressed(cache, **out)
+
+    z = np.load(cache)
+    patient = {k: z[k] for k in z.files}
+    patient.update(info)
+    patient["pid"] = pid
+    return patient
+
+
+# ============================================================
+# CARDIAC VOLUMES AND EJECTION FRACTION  (bug fixed: use `patient`, not `info`)
+# ============================================================
+def cardiac_metrics(pid):
+    """
+    Compute ventricular/myocardial volumes (mL) and ejection fraction (%)
+    from the ACDC ground-truth segmentations, plus height/weight/BSA.
+    Returns (features_array, group_label_str).
+    """
+    patient = load_patient(pid)
+    gt_ed = patient["gt_ED"]
+    gt_es = patient["gt_ES"]
+    spacing = patient["spacing"]
+
+    voxel_volume_mm3 = np.prod(spacing)
+    voxel_volume_ml = voxel_volume_mm3 / 1000.0
+
+    LVED = np.sum(gt_ed == LABELS["LV"]) * voxel_volume_ml
+    RVED = np.sum(gt_ed == LABELS["RV"]) * voxel_volume_ml
+    MYOED = np.sum(gt_ed == LABELS["MYO"]) * voxel_volume_ml
+    LVES = np.sum(gt_es == LABELS["LV"]) * voxel_volume_ml
+    RVES = np.sum(gt_es == LABELS["RV"]) * voxel_volume_ml
+    MYOES = np.sum(gt_es == LABELS["MYO"]) * voxel_volume_ml
+
+    LVEF = 100.0 * (LVED - LVES) / LVED if LVED > 0 else np.nan
+    RVEF = 100.0 * (RVED - RVES) / RVED if RVED > 0 else np.nan
+
+    height = patient["height"]   # <-- fixed (was `info["height"]`, undefined)
+    weight = patient["weight"]   # <-- fixed
+    bsa = np.sqrt(height * weight / 3600.0)
+
+    features = np.array([
+        height, weight, bsa,
+        LVED, LVES, RVED, RVES,
+        LVEF, RVEF, MYOED, MYOES,
+    ], dtype=np.float32)
+
+    return features, patient["group"]
+
+
+# ============================================================
+# BUILD FEATURE DATASET (X, y) FOR ALL LABELLED PATIENTS
+# ============================================================
+def build_feature_dataset(ids=TRAIN_IDS, require_labels=True):
+    """
+    Build (X, y) for the given patient ids.
+    If require_labels=False, patients whose Info.cfg has no usable
+    "Group" (as in the official ACDC test set, where it's hidden)
+    are simply skipped instead of raising.
+    """
+    X, y, kept_ids = [], [], []
+    for pid in ids:
+        try:
+            feats, group = cardiac_metrics(pid)
+        except KeyError:
+            if require_labels:
+                raise
+            print(f"[skip] patient{pid:03d}: no Group label available (unseen test set)")
+            continue
+        if group not in CLASS_TO_IDX:
+            if require_labels:
+                raise ValueError(f"patient{pid:03d}: unknown group '{group}'")
+            print(f"[skip] patient{pid:03d}: unlabeled/unknown group '{group}'")
+            continue
+        if np.isnan(feats).any():
+            print(f"[skip] patient{pid:03d}: NaN feature (group={group})")
+            continue
+        X.append(feats)
+        y.append(CLASS_TO_IDX[group])
+        kept_ids.append(pid)
+    if not X:
+        return (np.empty((0, len(FEATURE_NAMES)), dtype=np.float32),
+                np.empty((0,), dtype=np.int64), kept_ids)
+    return np.stack(X).astype(np.float32), np.array(y, dtype=np.int64), kept_ids
+
+
+# ============================================================
+# PYTORCH DATASET
+# ============================================================
+class ACDCFeatureDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.from_numpy(X).float()
+        self.y = torch.from_numpy(y).long()
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+
+# ============================================================
+# DNN MODEL
+# ============================================================
+class ACDCClassifier(nn.Module):
+    """Simple MLP for tabular feature classification."""
+
+    def __init__(self, in_features=len(FEATURE_NAMES), hidden_dim=32,
+                 n_classes=len(CLASSES), dropout=0.3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_features, hidden_dim),nn.BatchNorm1d(hidden_dim),nn.ReLU(),nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),nn.BatchNorm1d(hidden_dim // 2),nn.ReLU(),nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, n_classes),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+# ============================================================
+# TRAIN / EVAL LOOP
+# ============================================================
+def train_model(model, train_loader, val_loader, epochs=100, lr=1e-3,
+                 weight_decay=1e-4, device="cpu", verbose=True):
+    """
+    Trains the model and keeps track of the best epoch (lowest val loss).
+    At the end, the model's weights are restored to that best epoch's
+    state — this is what gets used for evaluation/testing afterwards,
+    not necessarily the weights from the very last epoch.
+    """
+    model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    criterion = nn.CrossEntropyLoss()
+
+    history = {"train_loss": [], "val_loss": []}
+    best_val_loss = float("inf")
+    best_epoch = -1
+    best_state = None
+
+    for epoch in range(1, epochs + 1):
+        # ---- train ----
+        model.train()
+        running_loss = 0.0
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            optimizer.zero_grad()
+            out = model(xb)
+            loss = criterion(out, yb)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item() * xb.size(0)
+        train_loss = running_loss / len(train_loader.dataset)
+
+        # ---- val ----
+        model.eval()
+        val_running_loss = 0.0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb, yb = xb.to(device), yb.to(device)
+                out = model(xb)
+                loss = criterion(out, yb)
+                val_running_loss += loss.item() * xb.size(0)
+        val_loss = val_running_loss / len(val_loader.dataset)
+
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+
+        # ---- track best epoch so far (lowest val loss) ----
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_epoch = epoch
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+        if verbose and (epoch % 10 == 0 or epoch == 1):
+            print(f"Epoch {epoch:3d}/{epochs} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f}")
+
+    # restore the best-epoch weights before returning
+    model.load_state_dict(best_state)
+    if verbose:
+        print(f"\nBest epoch: {best_epoch}/{epochs} (val_loss={best_val_loss:.4f}) "
+              f"-> restored these weights for evaluation/testing.")
+
+    history["best_epoch"] = best_epoch
+    history["best_val_loss"] = best_val_loss
+    return history
+
+
+def plot_loss_curve(history, save_path=None, title="Stage A - Model selection: loss curve"):
+    """
+    Plot train vs validation loss per epoch, marking the best epoch
+    (lowest val loss) that Stage B will refit for.
+    """
+    train_loss = history["train_loss"]
+    val_loss = history["val_loss"]
+    best_epoch = history["best_epoch"]
+    epochs_range = range(1, len(train_loss) + 1)
+ 
+    plt.figure(figsize=(8, 5))
+    plt.plot(epochs_range, train_loss, label="Train loss")
+    plt.plot(epochs_range, val_loss, label="Validation loss")
+    plt.axvline(best_epoch, color="gray", linestyle="--",
+                label=f"Best epoch ({best_epoch})")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss (cross-entropy)")
+    plt.title(title)
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    if save_path is not None:
+        plt.savefig(save_path, dpi=150)
+        print(f"Saved loss curve to {save_path}")
+    plt.show()
+
+
+def train_fixed_epochs(model, loader, epochs, lr=1e-3, weight_decay=1e-4,
+                        device="cpu", verbose=True):
+    """
+    Train for a FIXED number of epochs on a single loader, with no
+    validation split. Used for the final refit on ALL labelled training
+    patients, once `epochs` (= best_epoch from the earlier model-selection
+    run) has already been chosen.
+    """
+    model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    criterion = nn.CrossEntropyLoss()
+
+    train_losses = []
+    for epoch in range(1, epochs + 1):
+        model.train()
+        running_loss = 0.0
+        for xb, yb in loader:
+            xb, yb = xb.to(device), yb.to(device)
+            optimizer.zero_grad()
+            out = model(xb)
+            loss = criterion(out, yb)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item() * xb.size(0)
+        train_loss = running_loss / len(loader.dataset)
+        train_losses.append(train_loss)
+        if verbose and (epoch % 10 == 0 or epoch == 1 or epoch == epochs):
+            print(f"[Final refit] Epoch {epoch:3d}/{epochs} | train_loss={train_loss:.4f}")
+
+    return train_losses
+
+
+def evaluate(model, loader, device="cpu"):
+    model.eval()
+    y_true, y_pred = [], []
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb = xb.to(device)
+            out = model(xb)
+            preds = out.argmax(dim=1).cpu().numpy()
+            y_pred.extend(preds)
+            y_true.extend(yb.numpy())
+    acc = accuracy_score(y_true, y_pred)
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(len(CLASSES))))
+    report = classification_report(y_true, y_pred, target_names=CLASSES, zero_division=0)
+    return acc, cm, report
+
+
+def predict_unlabeled(model, ids, mu, sigma, device="cpu"):
+    """
+    Run the trained model on patients with no ground-truth Group label
+    (e.g. the official withheld ACDC test set) and return predicted classes.
+    """
+    model.eval()
+    preds = {}
+    for pid in ids:
+        feats, _ = cardiac_metrics(pid)  # group may be None here, that's fine
+        if feats is None or np.isnan(feats).any():
+            continue
+        x = torch.from_numpy(((feats - mu) / sigma).astype(np.float32)).unsqueeze(0).to(device)
+        with torch.no_grad():
+            pred_idx = model(x).argmax(dim=1).item()
+        preds[pid] = CLASSES[pred_idx]
+    return preds
+
+
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+
+    # 1. Build feature dataset from labelled patients (pid 1-100 -> "training" split)
+    X, y, _ = build_feature_dataset(TRAIN_IDS, require_labels=True)
+    print(f"Loaded {len(y)} training patients, {X.shape[1]} features, classes={CLASSES}")
+
+    hidden_dim = 32
+
+    # ============================================================
+    # STAGE A — MODEL SELECTION ONLY
+    # Stratified split of the TRAINING patients, used purely to pick the
+    # best number of epochs (early-stopping-style, lowest val loss).
+    # ============================================================
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=0.2, stratify=y, random_state=42
+    )
+
+    mu_sel, sigma_sel = X_train.mean(axis=0), X_train.std(axis=0) + 1e-8
+    train_ds = ACDCFeatureDataset((X_train - mu_sel) / sigma_sel, y_train)
+    val_ds = ACDCFeatureDataset((X_val - mu_sel) / sigma_sel, y_val)
+    train_loader = DataLoader(train_ds, batch_size=8, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=8, shuffle=False)
+
+    selection_model = ACDCClassifier(in_features=X.shape[1], hidden_dim=hidden_dim)
+    history = train_model(selection_model, train_loader, val_loader,
+                           epochs=500, lr=1e-3, device=device)
+    best_epoch = history["best_epoch"]
+
+    val_acc, val_cm, val_report = evaluate(selection_model, val_loader, device=device)
+    print(f"\n[Model selection | internal validation] accuracy: {val_acc:.3f}, "
+          f"chosen epochs for final refit: {best_epoch}")
+    print(CLASSES)
+    print(val_cm)
+    print(val_report)
+
+    # ============================================================
+    # STAGE B — FINAL REFIT ON ALL 100 LABELLED PATIENTS
+    # No train/val split anymore: use every available training patient,
+    # train a FRESH model for exactly `best_epoch` epochs (the number
+    # chosen above), and standardize using stats from the FULL training
+    # set. This is the model actually used for the final test.
+    # ============================================================
+    mu, sigma = X.mean(axis=0), X.std(axis=0) + 1e-8
+    full_ds = ACDCFeatureDataset((X - mu) / sigma, y)
+    full_loader = DataLoader(full_ds, batch_size=8, shuffle=True)
+
+    model = ACDCClassifier(in_features=X.shape[1], hidden_dim=hidden_dim)
+    final_train_losses = train_fixed_epochs(
+        model, full_loader, epochs=best_epoch, lr=1e-3, device=device
+    )
+    print(f"\n[Final refit] trained on all {len(y)} labelled patients for "
+          f"{best_epoch} epochs (final train_loss={final_train_losses[-1]:.4f})")
+
+    # ============================================================
+    # STAGE C — FINAL TEST on completely unseen patients (pid 101-150).
+    #    These patients were never used for training, validation,
+    #    standardization stats, or model/hyperparameter selection.
+    # ============================================================
+    X_test, y_test, test_ids = build_feature_dataset(TEST_IDS, require_labels=False)
+
+    if len(y_test) == 0:
+        print(
+            "\n[Test] No Group labels found for patients 101-150 "
+            "(this is the case in the official ACDC release, where test "
+            "diagnoses are withheld). Producing predictions only, with "
+            "no accuracy since ground truth is unavailable to you:"
+        )
+        preds = predict_unlabeled(model, TEST_IDS, mu, sigma, device=device)
+        for pid, cls in preds.items():
+            print(f"  patient{pid:03d} -> predicted {cls}")
+    else:
+        X_test_n = (X_test - mu) / sigma  # reuse train mu/sigma, never refit on test
+        test_ds = ACDCFeatureDataset(X_test_n, y_test)
+        test_loader = DataLoader(test_ds, batch_size=8, shuffle=False)
+
+        test_acc, test_cm, test_report = evaluate(model, test_loader, device=device)
+        print(f"\n[FINAL TEST — unseen patients {test_ids[0]:03d}-{test_ids[-1]:03d}] "
+              f"accuracy: {test_acc:.3f}")
+        print(CLASSES)
+        print(test_cm)
+        print(test_report)
+
+    # save mu/sigma + model for reuse on the ACDC test set
+    torch.save({
+        "model_state": model.state_dict(),
+        "hidden_dim": 32,
+        "best_epoch": history["best_epoch"],
+        "best_val_loss": history["best_val_loss"],
+        "mu": mu, "sigma": sigma,
+        "classes": CLASSES,
+    }, BASE_DIR / "acdc_dnn_checkpoint.pt")
+
+    # plot train vs val loss for the model-selection stage
+    plot_loss_curve(history, save_path=BASE_DIR / "loss_curve_stage_a.png")
+    
+
+if __name__ == "__main__":
+    main()
